@@ -73,6 +73,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/gel-comparisons` | 只读比较 2~8 条已保存记录的凝胶条带：汇总片段长度按降序聚类（条带内 `(max-min)/max <= resolution_ratio`），返回条带长度范围、各泳道片段数、总碱基数与诊断条带（不落库，记录不存在返回 404） |
 | `POST` | `/ligation-compatibility` | 只读枚举 2~8 条已保存记录之间可连接的片段末端对：黏端要求一方 5' 突出端序列等于另一方 3' 突出端序列的反向互补，平端仅与平端兼容（可通过 `include_blunt` 关闭），返回按记录/片段/端方向稳定排序的配对、兼容类型、连接后突出端与总数（不落库，记录不存在返回 404） |
 | `POST` | `/ligation-assembly` | 只读规划 2~8 条已保存记录之间的最长片段拼接链：复用末端反向互补兼容判定构建有向图，搜索不重复使用记录的最长线性链（每条记录最多贡献一个片段，可正向/反向摆入，`max_chain_length` 限制链上节点数），同长度方案按记录请求顺序、片段索引与端方向稳定择优，返回节点端点、连接类型/突出端、总连接数与未能延伸的原因（不落库，记录不存在返回 404，候选片段过多返回 422） |
+| `POST` | `/gc-content` | 只读计算提交 IUPAC 序列的固定窗口 GC 含量范围：每个窗口返回确定碱基贡献的最低与最高 GC 百分比，简并符号按其可能碱基分别计入上下界；窗口短于序列时按指定步长滑动；环形序列窗口可跨越末尾回到开头，每个窗口最多覆盖一圈（不落库、不依赖已保存记录） |
 | `GET` | `/health` | 健康检查 |
 
 ### 提交示例
@@ -741,6 +742,117 @@ curl -X POST http://localhost:8000/ligation-assembly \
 | `digest_ids` 含非整数、`include_blunt` 为非法布尔值 | **422** |
 | 全部记录的候选片段总数超过 64（枚举上限） | **422** |
 
+## 固定窗口 GC 含量范围
+
+对**请求中直接提交**的 IUPAC DNA 序列，按**固定长度窗口**计算 GC 含量的
+**最低与最高百分比**。序列中的简并符号按其**可能碱基**分别计入上下界，
+因此含简并符号的窗口得到的是一个确定的 GC 范围而非单一数值。**接口完全
+只读**：序列随请求提交、在内存中计算，不写库、不依赖任何已保存记录。
+
+### 上下界口径
+
+对窗口中的每个碱基，按其 IUPAC 可能碱基集合确定对 GC 计数的贡献：
+
+| 符号 | 可能碱基 | 最小 GC 贡献 | 最大 GC 贡献 |
+| --- | --- | --- | --- |
+| `G` / `C` | G 或 C | 1 | 1 |
+| `A` / `T` | A 或 T | 0 | 0 |
+| `S` | G, C | 1 | 1 |
+| `W` | A, T | 0 | 0 |
+| `R` `Y` `K` `M` | 一个 GC + 一个 AT | 0 | 1 |
+| `B` `D` `H` `V` | 三个碱基（含且仅含部分 GC） | 0 | 1 |
+| `N` | A, C, G, T | 0 | 1 |
+
+- **最小 GC 计数**：仅统计"无论简并符号取何值都必定是 G/C"的碱基，即
+  可能碱基集合是 `{G,C}` 子集的符号（确定的 G/C 与 `S`）；
+- **最大 GC 计数**：统计"可能是 G/C"的全部碱基，即可能碱基集合与
+  `{G,C}` 有交集的符号；
+- 窗口 GC 百分比 = GC 计数 / 窗口长度 × 100，最小、最大百分比分别由
+  最小、最大计数除以**同一个窗口长度**得到；确定碱基对上下界贡献相同，
+  因此 `gc_max_percent - gc_min_percent` 全部来自简并符号。
+
+### 请求
+
+```bash
+curl -X POST http://localhost:8000/gc-content \
+  -H 'Content-Type: application/json' \
+  -d '{"sequence": "GSRWNA", "topology": "linear", "window_length": 4, "step": 2}'
+```
+
+- `sequence`：**必填**，仅允许 IUPAC 碱基 `ACGTRYSWKMBDHVN`（大小写均可，
+  按大写处理）。
+- `topology`：**可选**，`linear`（默认）或 `circular`。
+- `window_length`：**必填**，固定窗口长度（碱基数），闭区间
+  **`[1, 序列长度]`**；窗口长度等于序列长度时只返回一个全长窗口。
+- `step`：**可选**，窗口滑动步长（正整数）；**省略时取
+  `window_length`**，即不重叠窗口。
+
+### 窗口切分
+
+- **线性序列**：窗口起点为 `0, step, 2·step, ...`，只保留**完全落在序列内**
+  的窗口（`start + window_length <= 序列长度`）；末尾不足一个完整窗口的
+  尾随碱基**不单独开窗、也不补长**，其数量在 `ignored_trailing_bases`
+  中回显（步长整除 `序列长度 - 窗口长度` 时为 0）。
+- **环形序列**：窗口可**跨越末尾回到开头**，窗口内碱基下标对序列长度取模；
+  起点同样取 `0, step, 2·step, ...` 且 `start < 序列长度`，即一整圈被
+  `ceil(序列长度 / step)` 个起点完整覆盖。由于
+  **`window_length <= 序列长度`**，每个窗口最多覆盖一圈，任一物理碱基在
+  单个窗口内至多被计入一次；跨末尾的窗口 `wraps_origin` 为 `true`。
+- `window_length == 序列长度` 时，任意起点覆盖的都是同一碱基多重集，
+  因此环形序列也只返回起点 0 的一个全长窗口（`wraps_origin: false`）。
+
+### 响应
+
+以序列 `GSRWNA`（G=确定 GC；S=G/C 必为 GC；R=A/G 可能为 GC；W=A/T 恒非
+GC；N=任意可能为 GC；A=确定非 GC）、窗口长度 4、步长 2 为例：
+
+```json
+{
+  "topology": "linear",
+  "sequence_length": 6,
+  "window_length": 4,
+  "step": 2,
+  "window_count": 2,
+  "ignored_trailing_bases": 0,
+  "windows": [
+    {"index": 0, "start": 0, "window_length": 4,
+     "gc_min_count": 2, "gc_max_count": 3,
+     "gc_min_percent": 50.0, "gc_max_percent": 75.0,
+     "wraps_origin": false},
+    {"index": 1, "start": 2, "window_length": 4,
+     "gc_min_count": 0, "gc_max_count": 2,
+     "gc_min_percent": 0.0, "gc_max_percent": 50.0,
+     "wraps_origin": false}
+  ]
+}
+```
+
+- 窗口 0 `GSRW`：必定为 GC 的是 G、S（2 个），R 可能再贡献 1 个，
+  故计数范围 `[2, 3]`，即 **50% ~ 75%**；
+- 窗口 1 `RWNA`：没有任何碱基必定为 G/C（最小 0），R 与 N 各可能贡献
+  1 个（最大 2），故范围 `[0, 2]`，即 **0% ~ 50%**。
+- 每个窗口字段：
+  - `index`：窗口序号，从 0 起按起点升序连续编号；
+  - `start`：窗口起点（top 链 0-based 坐标）；
+  - `gc_min_count` / `gc_max_count`：窗口内 GC 碱基数的最小/最大值；
+  - `gc_min_percent` / `gc_max_percent`：对应的 GC 百分比；
+  - `wraps_origin`：环形窗口是否跨越末尾回到开头（线性恒为 `false`）。
+- 环形跨原点示例：序列 `GCGCAT`（长度 6）、`window_length=4`、`step=4`
+  返回两个窗口，起点 4 的窗口覆盖物理位置 `4,5,0,1`（`ATGC`），
+  `wraps_origin: true`、GC 计数为 2/2（50%）。
+
+### 校验与状态码
+
+| 情形 | 状态码 |
+| --- | --- |
+| `window_length` > 序列长度 | **422** |
+| `window_length` < 1 / `step` < 1（含 0 与负数） | **422** |
+| `sequence` 为空或含非 IUPAC 字符 | **422** |
+| `topology` 不是 `linear` / `circular` | **422** |
+
+接口不引用任何已保存记录，因此不存在 404 情形；请求处理不产生、不修改
+任何数据库内容。
+
 ## 行为规则
 
 - **双向搜索**：同时在 top 链搜索 `pattern` 与 `reverse_complement(pattern)`
@@ -768,6 +880,7 @@ app/
 ├── gel.py       # 凝胶条带比较（片段长度降序聚类、诊断条带标记）
 ├── ligation.py  # 末端连接兼容性分析（跨记录末端对枚举、黏端/平端兼容判定）
 ├── assembly.py  # 片段拼接链规划（有向图、不重复用记录的最长简单路径与稳定择优）
+├── gc_content.py # 固定窗口 GC 含量范围（IUPAC 上下界贡献、线性滑动/环形跨原点）
 ├── iupac.py     # IUPAC 编码表与反向互补
 ├── schemas.py   # 请求/响应模型与校验
 └── db.py        # SQLite 持久化（启动时自动建表）
@@ -780,7 +893,8 @@ tests/
 ├── test_methylation_api.py   # 甲基化阻断分析 API 测试
 ├── test_gel_api.py       # 凝胶条带比较 API 测试
 ├── test_ligation_api.py  # 末端连接兼容性 API 测试
-└── test_assembly_api.py  # 片段拼接链规划 API 测试
+├── test_assembly_api.py  # 片段拼接链规划 API 测试
+└── test_gc_content_api.py  # 固定窗口 GC 含量范围 API 测试
 Dockerfile
 docker-compose.yml
 requirements.txt

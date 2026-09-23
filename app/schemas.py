@@ -410,6 +410,82 @@ class MethylationAnalysisResponse(BaseModel):
     fragments: list[FragmentOut]
 
 
+# ---------- 固定窗口 GC 含量范围 ----------
+
+
+class GcContentRequest(BaseModel):
+    """固定窗口 GC 含量范围请求：提交 IUPAC 序列 + 窗口长度与步长。
+
+    sequence 仅允许 IUPAC 碱基（大小写均可，存储为大写）；window_length
+    取闭区间 [1, 序列长度]（空序列在字段校验阶段即被拒绝，因此窗口越界
+    检查一定能取到序列长度）；step 为正整数，省略时取 window_length
+    （不重叠窗口）。整个分析只读，不读写数据库。
+    """
+
+    sequence: str = Field(examples=["ATGCSWRYKMBVHDN"])
+    topology: Literal["linear", "circular"] = "linear"
+    window_length: int = Field(
+        ge=1, description="固定窗口长度（碱基数），1 <= window_length <= 序列长度",
+        examples=[10],
+    )
+    step: int | None = Field(
+        default=None,
+        ge=1,
+        description="窗口滑动步长（碱基数）；省略时取 window_length（不重叠）",
+        examples=[5],
+    )
+
+    @field_validator("sequence")
+    @classmethod
+    def _sequence_ok(cls, v: str) -> str:
+        return _check_iupac(v, "sequence")
+
+    @model_validator(mode="after")
+    def _window_within_sequence(self) -> "GcContentRequest":
+        if self.window_length > len(self.sequence):
+            raise ValueError(
+                f"window_length {self.window_length} exceeds sequence length "
+                f"{len(self.sequence)}"
+            )
+        return self
+
+
+class GcWindowOut(BaseModel):
+    """一个窗口的 GC 含量范围：简并符号按可能碱基分别计入下/上界。
+
+    gc_min/max_count 为窗口内 GC 碱基数的最小/最大值；gc_min/max_percent
+    为对应计数除以窗口长度的百分比。确定碱基对上下界贡献相同，上下界的
+    差全部来自简并符号。wraps_origin 为 True 表示环形窗口跨越末尾回到
+    开头（线性窗口恒为 False）。
+    """
+
+    index: int
+    start: int
+    window_length: int
+    gc_min_count: int
+    gc_max_count: int
+    gc_min_percent: float
+    gc_max_percent: float
+    wraps_origin: bool
+
+
+class GcContentResponse(BaseModel):
+    """GC 含量窗口结果：窗口按 start 升序排列，index 从 0 起连续编号。
+
+    step 回显实际使用的步长（省略入参时为 window_length）；
+    ignored_trailing_bases 为线性序列末尾不足一个完整窗口而未开窗的
+    碱基数（环形序列恒为 0）。
+    """
+
+    topology: Literal["linear", "circular"]
+    sequence_length: int
+    window_length: int
+    step: int
+    window_count: int
+    ignored_trailing_bases: int
+    windows: list[GcWindowOut]
+
+
 # ---------- 凝胶条带比较 ----------
 
 

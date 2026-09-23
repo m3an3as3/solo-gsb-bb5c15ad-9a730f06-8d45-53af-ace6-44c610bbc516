@@ -27,6 +27,11 @@
                                            平端连接，max_chain_length 限制链上节点数；
                                            返回节点端点、连接类型/突出端、总连接数与
                                            未能延伸的原因（不落库）
+    POST /gc-content                      只读计算提交 IUPAC 序列的固定窗口 GC 含量范围：
+                                           每窗返回确定碱基贡献的最低/最高 GC 百分比，
+                                           简并符号按可能碱基分别计入上下界；窗口短于
+                                           序列时按步长滑动；环形窗口可跨末尾回到开头，
+                                           每个窗口最多覆盖一圈（不落库）
     GET  /health                           健康检查
 """
 
@@ -39,6 +44,7 @@ from fastapi import FastAPI, HTTPException
 
 from .db import Database
 from .digest import run_digest
+from .gc_content import gc_content_windows
 from .assembly import MAX_ASSEMBLY_FRAGMENTS, plan_assembly_chain, public_node
 from .distribution import MAX_PARTIAL_CUTS, partial_digest_distribution
 from .gel import compare_gel_lanes
@@ -52,6 +58,8 @@ from .schemas import (
     EnzymeIn,
     EnzymePanelPlanRequest,
     EnzymePanelPlanResponse,
+    GcContentRequest,
+    GcContentResponse,
     GelComparisonRequest,
     GelComparisonResponse,
     LigationAssemblyRequest,
@@ -456,4 +464,37 @@ def ligation_assembly(request: LigationAssemblyRequest) -> dict:
         ],
         "stop_reason": plan["stop_reason"],
         "stop_reason_detail": plan["stop_reason_detail"],
+    }
+
+
+@app.post("/gc-content", response_model=GcContentResponse)
+def gc_content(request: GcContentRequest) -> dict:
+    # 纯计算接口：序列随请求提交、不落库、不依赖任何已保存记录
+    length = len(request.sequence)
+    # step 省略时取窗口长度（不重叠窗口）；Pydantic 已保证显式传入值 >= 1
+    step = request.step if request.step is not None else request.window_length
+
+    windows = gc_content_windows(
+        request.sequence,
+        request.window_length,
+        step,
+        request.topology == "circular",
+    )
+
+    # 线性序列末尾不足一个完整窗口的尾随碱基不单独开窗，其数量为
+    # (L - W) 对步长取余（W == L 时为 0）；环形序列起点恒覆盖完整
+    # 一圈，不存在被忽略的碱基
+    if request.topology == "linear":
+        ignored = (length - request.window_length) % step
+    else:
+        ignored = 0
+
+    return {
+        "topology": request.topology,
+        "sequence_length": length,
+        "window_length": request.window_length,
+        "step": step,
+        "window_count": len(windows),
+        "ignored_trailing_bases": ignored,
+        "windows": windows,
     }
