@@ -656,3 +656,66 @@ class LigationAssemblyResponse(BaseModel):
     ]
     stop_reason_detail: str
 
+
+# ---------- 固定窗口 GC 含量范围 ----------
+
+
+class GcContentRequest(BaseModel):
+    """固定窗口 GC 含量范围请求：IUPAC 序列 + 窗口长度 + 步长。
+
+    纯只读计算，不引用任何已保存记录、不写数据库。``window_length`` /
+    ``step`` 为正整数，且窗口长度不得超过序列长度（越界 -> 422）；
+    窗口长度等于序列长度时只返回一个整长窗口（step 不参与取窗）。
+    """
+
+    sequence: str = Field(examples=["ATGCSWNATG"])
+    topology: Literal["linear", "circular"] = "linear"
+    window_length: int = Field(ge=1, description="固定窗口长度（碱基数）", examples=[4])
+    step: int = Field(ge=1, description="窗口小于序列长度时的滑动步长", examples=[2])
+
+    @field_validator("sequence")
+    @classmethod
+    def _sequence_ok(cls, v: str) -> str:
+        return _check_iupac(v, "sequence")
+
+    @model_validator(mode="after")
+    def _window_fits_sequence(self) -> "GcContentRequest":
+        if self.window_length > len(self.sequence):
+            raise ValueError(
+                f"window_length {self.window_length} exceeds sequence length "
+                f"{len(self.sequence)}"
+            )
+        return self
+
+
+class GcWindowOut(BaseModel):
+    """单个窗口的 GC 含量范围。
+
+    min/max_gc_count 为窗口内"必然为 GC"/"可能为 GC"的碱基数：
+    确定碱基 C/G 两者都计入、A/T 两者都不计；简并符号按其可能碱基
+    分别计入上/下界（仅 S={G,C} 计入下界）。min/max_gc_percent 为
+    相应计数除以窗口长度的百分比，保留 6 位小数。环形窗口的 end 为
+    取模后的坐标（可能小于 start），``wraps_origin`` 标明是否跨原点。
+    """
+
+    index: int
+    start: int
+    end: int
+    length: int
+    wraps_origin: bool
+    min_gc_count: int
+    max_gc_count: int
+    min_gc_percent: float
+    max_gc_percent: float
+
+
+class GcContentResponse(BaseModel):
+    """GC 含量窗口结果：窗口按起点升序排列（环形最后一个窗口可能跨原点）。"""
+
+    topology: Literal["linear", "circular"]
+    sequence_length: int
+    window_length: int
+    step: int
+    window_count: int
+    windows: list[GcWindowOut]
+

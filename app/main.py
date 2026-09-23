@@ -27,6 +27,11 @@
                                            平端连接，max_chain_length 限制链上节点数；
                                            返回节点端点、连接类型/突出端、总连接数与
                                            未能延伸的原因（不落库）
+    POST /gc-content                     只读对提交的 IUPAC 序列按固定窗口计算 GC 含量
+                                           范围：每窗口返回确定碱基贡献的最低/最高 GC
+                                           百分比，简并符号按可能碱基分别计入上下界；
+                                           窗口短于序列时按步长滑动，环形窗口可跨原点、
+                                           但每窗最多一圈（不落库，不依赖已保存记录）
     GET  /health                           健康检查
 """
 
@@ -41,6 +46,7 @@ from .db import Database
 from .digest import run_digest
 from .assembly import MAX_ASSEMBLY_FRAGMENTS, plan_assembly_chain, public_node
 from .distribution import MAX_PARTIAL_CUTS, partial_digest_distribution
+from .gccontent import gc_content_windows
 from .gel import compare_gel_lanes
 from .ligation import find_compatible_pairs
 from .methylation import analyze_methylation
@@ -52,6 +58,8 @@ from .schemas import (
     EnzymeIn,
     EnzymePanelPlanRequest,
     EnzymePanelPlanResponse,
+    GcContentRequest,
+    GcContentResponse,
     GelComparisonRequest,
     GelComparisonResponse,
     LigationAssemblyRequest,
@@ -81,7 +89,8 @@ app = FastAPI(
     title="DNA Restriction Digest Simulator",
     version="1.0.0",
     description="DNA 限制性酶切模拟：支持线性/环形序列、IUPAC 简并碱基、"
-                "双链切口偏移、黏端/平端分析与片段生成。",
+                "双链切口偏移、黏端/平端分析与片段生成；另提供只读的"
+                "固定窗口 GC 含量范围（简并碱基上下界）计算。",
     lifespan=lifespan,
 )
 
@@ -456,4 +465,18 @@ def ligation_assembly(request: LigationAssemblyRequest) -> dict:
         ],
         "stop_reason": plan["stop_reason"],
         "stop_reason_detail": plan["stop_reason_detail"],
+    }
+
+
+@app.post("/gc-content", response_model=GcContentResponse)
+def gc_content(request: GcContentRequest) -> dict:
+    # 纯内存计算：序列直接随请求提交，不引用任何已保存记录，也不写库
+    return {
+        "topology": request.topology,
+        "sequence_length": len(request.sequence),
+        "window_length": request.window_length,
+        "step": request.step,
+        **gc_content_windows(
+            request.sequence, request.topology, request.window_length, request.step
+        ),
     }
